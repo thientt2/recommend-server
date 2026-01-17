@@ -20,7 +20,7 @@ class APISettings(BaseSettings):
     REDIS_DB: int = 0
     REDIS_PASSWORD: str = ""
     CACHE_TTL: int = 3600
-    CACHE_ENABLED: bool = True
+    CACHE_ENABLED: bool = False
     
     # Models
     MODELS_DIR: str = "./trained_models"
@@ -32,6 +32,12 @@ class APISettings(BaseSettings):
     
     # Logging
     LOG_LEVEL: str = "INFO"
+    
+    # Session-based Recommendation Settings
+    SESSION_ALPHA: float = 0.3          # Session influence factor (α)
+    TIME_DECAY_FACTOR: float = 0.9      # Time decay per position
+    CLUSTER_BOOST: float = 0.15         # Cluster boost factor
+    MODEL_FILE: str = "recommend_model.pkl"  # Hybrid model file
     
     # ⭐ THÊM DÒNG NÀY - Cho phép extra fields từ .env
     model_config = {

@@ -19,7 +19,7 @@ class RecommendationEngine:
     async def get_recommendations(
         self,
         user_id: int,
-        k: int = 10,
+        k: int = 20,
         model_name: str = 'als',
         exclude_seen: bool = True
     ) -> List[Dict[str, Any]]:
@@ -34,7 +34,7 @@ class RecommendationEngine:
         
         try:
             # Get ALS model
-            model = self.model_loader.model
+            model = self.model_loader.als_model
             if model is None:
                 raise ValueError("ALS model not loaded")
             
@@ -81,7 +81,7 @@ class RecommendationEngine:
     ) -> List[Tuple[int, float]]:
         """Get recommendations from ALS model"""
         try:
-            model = self.model_loader.model
+            model = self.model_loader.als_model
             train_matrix = self.model_loader.train_matrix
             
             if hasattr(model, 'recommend'):
@@ -121,7 +121,7 @@ class RecommendationEngine:
     ) -> List[Tuple[int, float]]:
         """Manual ALS recommendation if model.recommend doesn't work"""
         try:
-            model = self.model_loader.model
+            model = self.model_loader.als_model
             user_factors = model.user_factors[user_internal_id]
             item_factors = model.item_factors
             scores = item_factors.dot(user_factors)

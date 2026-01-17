@@ -6,9 +6,13 @@ from fastapi import APIRouter, HTTPException, Query
 from api.schemas.models import (
     RecommendationRequest,
     RecommendationResponse,
-    SimilarProduct
+    SimilarProduct,
+    SessionEvent,
+    RealtimeRecommendationRequest,
+    RealtimeRecommendationResponse
 )
 from api.services.recommender import recommender
+from api.services.session_recommender import session_recommender
 from api.services.model_loader import model_loader
 from api.services.cache import cache
 import logging
@@ -19,7 +23,7 @@ router = APIRouter(prefix="/recommendations", tags=["Recommendations"])
 @router.get("", response_model=RecommendationResponse)
 async def get_recommendations(
     user_id: int = Query(..., description="User ID to get recommendations for"),
-    k: int = Query(10, ge=1, le=100, description="Number of recommendations"),
+    k: int = Query(20, ge=1, le=100, description="Number of recommendations"),
     model: str = Query('als', description="Model to use (default: als)"),
     exclude_seen: bool = Query(True, description="Exclude seen products")
 ):
@@ -37,29 +41,18 @@ async def get_recommendations(
         exclude_seen=exclude_seen
     )
     
-    if not recommendations:
-        raise HTTPException(404, "No recommendations found for this user")
-    
+    # Return empty list for cold-start users instead of 404
     return {
         "userId": user_id,
-        "recommendations": recommendations,
+        "recommendations": recommendations or [],
         "model": model,
-        "count": len(recommendations)
+        "count": len(recommendations) if recommendations else 0
     }
-
-@router.get("/user/{user_id}", response_model=RecommendationResponse)
-async def get_recommendations_by_id(
-    user_id: int,
-    k: int = Query(10, ge=1, le=100),
-    model: str = Query('als')
-):
-    """Get recommendations by user ID (alternative endpoint)"""
-    return await get_recommendations(user_id=user_id, k=k, model=model, exclude_seen=True)
 
 @router.get("/similar/{product_id}")
 async def get_similar_items(
     product_id: int,
-    k: int = Query(10, ge=1, le=100)
+    k: int = Query(20, ge=1, le=100)
 ):
     """Get similar items"""
     
@@ -87,3 +80,49 @@ async def list_models():
         "models": model_loader.get_available_models(),
         "count": len(model_loader.get_available_models())
     }
+
+
+@router.post("/realtime", response_model=RealtimeRecommendationResponse)
+async def get_realtime_recommendations(request: RealtimeRecommendationRequest):
+    """
+    Get real-time hybrid recommendations
+    
+    Combines:
+    - ALS long-term preferences (if user exists in training data)
+    - Session-based short memory (dynamic user vector from recent interactions)
+    - Content cluster boosting (boost items in popular session clusters)
+    
+    This endpoint does NOT retrain the model - it uses vector operations for low latency.
+    """
+    
+    # Convert Pydantic models to dicts for the session recommender
+    session_events = [
+        {
+            "item_id": event.item_id,
+            "action": event.action,
+            "timestamp": event.timestamp
+        }
+        for event in request.session_events
+    ]
+    
+    result = await session_recommender.get_realtime_recommendations(
+        user_id=request.user_id,
+        session_events=session_events,
+        k=request.k,
+        exclude_session_items=request.exclude_session_items,
+        enable_cluster_boost=request.enable_cluster_boost,
+        session_alpha=request.session_alpha
+    )
+    
+    if "error" in result and not result.get("recommendations"):
+        raise HTTPException(500, f"Recommendation error: {result.get('error')}")
+    
+    return {
+        "userId": request.user_id,
+        "recommendations": result.get("recommendations", []),
+        "sessionItems": result.get("session_items", 0),
+        "topClusters": result.get("top_clusters", []),
+        "isColdStart": result.get("is_cold_start", False),
+        "count": len(result.get("recommendations", []))
+    }
+
