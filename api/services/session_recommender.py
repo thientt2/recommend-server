@@ -8,6 +8,7 @@ Combines:
 """
 
 import numpy as np
+import random
 from typing import List, Dict, Any, Optional, Tuple
 from collections import Counter
 from api.services.model_loader import model_loader
@@ -44,6 +45,7 @@ class SessionRecommender:
         self.session_alpha = getattr(settings, 'SESSION_ALPHA', 0.3)
         self.time_decay_factor = getattr(settings, 'TIME_DECAY_FACTOR', 0.9)
         self.cluster_boost = getattr(settings, 'CLUSTER_BOOST', 0.15)
+        self.last_item_boost = getattr(settings, 'LAST_ITEM_BOOST', 2.0)  # Extra boost for last interacted item
     
     def compute_session_vector(
         self, 
@@ -91,7 +93,7 @@ class SessionRecommender:
             if embedding is None:
                 continue
             
-            # Compute weight: action_weight × time_decay
+            # Compute weight: action_weight × time_decay × last_item_boost
             action_weight = self.ACTION_WEIGHTS.get(action, 1.0)
             
             # Time decay: more recent events (higher index) get higher weight
@@ -99,7 +101,14 @@ class SessionRecommender:
             position_from_end = n_events - 1 - i
             time_weight = self.time_decay_factor ** position_from_end
             
-            combined_weight = action_weight * time_weight
+            # Apply extra boost to the LAST item (most recent interaction)
+            is_last_item = (i == n_events - 1)
+            last_boost = self.last_item_boost if is_last_item else 1.0
+            
+            combined_weight = action_weight * time_weight * last_boost
+            
+            if is_last_item:
+                logger.debug(f"Last item {item_id} boosted with {last_boost}x multiplier")
             
             if combined_weight > 0:
                 weighted_sum += embedding * combined_weight
@@ -212,52 +221,119 @@ class SessionRecommender:
     ) -> List[Dict[str, Any]]:
         """
         Step 3: Content Branch - Retrieve candidates from same clusters
+        
+        Priority:
+        1. Last item's cluster (most relevant to current interest)
+        2. Other voted clusters from session
         """
         candidates = []
-        top_clusters = self.vote_clusters(session_events, top_k=3)
         
+        # Build seen items set
         seen_items = set()
         for event in session_events:
             if event.get('item_id'):
                 seen_items.add(event.get('item_id'))
-
-        for cluster_id in top_clusters:
+        
+        # Priority 1: Get cluster from LAST interacted item
+        last_item_cluster = None
+        if session_events:
+            logger.info(f"Session has {len(session_events)} events, checking for last item cluster...")
+            # Find the last event with a valid item_id (most recent)
+            for event in reversed(session_events):
+                item_id = event.get('item_id')
+                logger.info(f"Checking event: item_id={item_id}, action={event.get('action')}")
+                if item_id is not None:
+                    item_code = self.loader.get_item_internal_id(item_id)
+                    logger.info(f"  -> item_code (internal) = {item_code}")
+                    if item_code is not None:
+                        last_item_cluster = self.loader.get_item_cluster(item_code)
+                        logger.info(f"  -> cluster = {last_item_cluster}")
+                        if last_item_cluster is not None:
+                            logger.info(f"Last item {item_id} belongs to cluster {last_item_cluster}")
+                            break
+                    else:
+                        logger.warning(f"Item {item_id} NOT FOUND in model mappings!")
+        
+        # Priority 2: Get voted clusters from all session items
+        voted_clusters = self.vote_clusters(session_events, top_k=3)
+        
+        # Build final cluster list: last_item_cluster first, then voted (without duplicates)
+        clusters_to_use = []
+        if last_item_cluster is not None:
+            clusters_to_use.append(last_item_cluster)
+        for c in voted_clusters:
+            if c not in clusters_to_use:
+                clusters_to_use.append(c)
+        
+        logger.info(f"Cluster priority order: {clusters_to_use}")
+        
+        # Retrieve items from each cluster with random shuffle for variety
+        # PRIORITY: Get at least 5 items from last_item_cluster
+        LAST_ITEM_CLUSTER_MIN = 5
+        
+        ids_added = set()
+        for idx, cluster_id in enumerate(clusters_to_use):
             cluster_items = self.loader.get_items_by_cluster(cluster_id)
-            # Simple ranking: take first N items (assuming they are somewhat sorted or random)
-            # In production, sort by popularity or rating
+            
+            # Shuffle items to get variety on each request
+            cluster_items_list = list(cluster_items) if not isinstance(cluster_items, list) else cluster_items
+            random.shuffle(cluster_items_list)
+            
+            # Determine limit for this cluster
+            if idx == 0 and last_item_cluster is not None:
+                # First cluster (last_item_cluster) gets at least 5 items
+                current_limit = max(LAST_ITEM_CLUSTER_MIN, limit_per_cluster)
+                logger.info(f"Retrieving {current_limit} items from last_item_cluster {cluster_id}")
+            else:
+                current_limit = limit_per_cluster
+            
             count = 0
-            for item_code in cluster_items:
-                if count >= limit_per_cluster:
+            for item_code in cluster_items_list:
+                if count >= current_limit:
                     break
                 
                 prod_id = self.loader.get_product_id(item_code)
-                if prod_id and prod_id not in seen_items:
+                if prod_id and prod_id not in seen_items and prod_id not in ids_added:
                     candidates.append({
                         'productId': prod_id,
-                        'score': 1.0, # Placeholder score for content match
+                        'score': 1.0,
                         'rank': 0,
                         'cluster': cluster_id,
                         'source': 'content_cluster'
                     })
-                    seen_items.add(prod_id)
+                    ids_added.add(prod_id)
                     count += 1
+            
+            logger.info(f"Cluster {cluster_id}: retrieved {count} items")
+        
+        logger.info(f"Retrieved {len(candidates)} cluster candidates total")
         return candidates
 
     def interleave_results(
         self,
         als_results: List[Dict[str, Any]],
         content_results: List[Dict[str, Any]],
-        k: int
+        k: int = None  # k is now optional, if None returns all
     ) -> List[Dict[str, Any]]:
         """
         Step 4: Fusion - Interleave results
+        Ratio: 1 ALS : 3 Content (prioritize cluster-based for session relevance)
+        If k is None, returns ALL combined results
         """
+        total_possible = len(als_results) + len(content_results)
+        max_results = k if k is not None else total_possible
+        logger.info(f"Interleaving: {len(als_results)} ALS + {len(content_results)} Content -> max {max_results}")
+        
         final_list = []
         i, j = 0, 0
         ids_in_list = set()
         
-        while len(final_list) < k and (i < len(als_results) or j < len(content_results)):
-            # Pick from ALS
+        while (i < len(als_results) or j < len(content_results)):
+            # Check if we've reached the limit (if k is set)
+            if k is not None and len(final_list) >= k:
+                break
+                
+            # Pick 1 from ALS
             if i < len(als_results):
                 item = als_results[i]
                 if item['productId'] not in ids_in_list:
@@ -266,16 +342,19 @@ class SessionRecommender:
                     ids_in_list.add(item['productId'])
                 i += 1
             
-            if len(final_list) >= k:
+            if k is not None and len(final_list) >= k:
                 break
                 
-            # Pick from Content
-            if j < len(content_results):
-                item = content_results[j]
-                if item['productId'] not in ids_in_list:
-                    final_list.append(item)
-                    ids_in_list.add(item['productId'])
-                j += 1
+            # Pick 3 from Content (cluster-based) to prioritize session relevance
+            for _ in range(3):
+                if j < len(content_results):
+                    if k is not None and len(final_list) >= k:
+                        break
+                    item = content_results[j]
+                    if item['productId'] not in ids_in_list:
+                        final_list.append(item)
+                        ids_in_list.add(item['productId'])
+                    j += 1
                 
         # Update ranks
         for idx, item in enumerate(final_list):
@@ -283,6 +362,40 @@ class SessionRecommender:
             
         return final_list
 
+    def merge_results(
+        self,
+        als_results: List[Dict[str, Any]],
+        content_results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Simple merge: ALS results first, then Content results
+        Removes duplicates, assigns ranks
+        
+        Expected: 10 ALS + 10 Content = ~20 total (after dedup)
+        """
+        logger.info(f"Merging: {len(als_results)} ALS + {len(content_results)} Content")
+        
+        final_list = []
+        ids_in_list = set()
+        
+        # Add all ALS results first
+        for item in als_results:
+            if item['productId'] not in ids_in_list:
+                final_list.append(item)
+                ids_in_list.add(item['productId'])
+        
+        # Add Content results (skip duplicates)
+        for item in content_results:
+            if item['productId'] not in ids_in_list:
+                final_list.append(item)
+                ids_in_list.add(item['productId'])
+        
+        # Update ranks
+        for idx, item in enumerate(final_list):
+            item['rank'] = idx + 1
+        
+        logger.info(f"Merged: {len(final_list)} total unique items")
+        return final_list
     async def get_realtime_recommendations(
         self,
         user_id: int,
@@ -333,8 +446,8 @@ class SessionRecommender:
                     for idx in exclude_set:
                         if idx < len(scores): scores[idx] = -np.inf
                         
-                    # Top K for ALS branch
-                    top_indices = np.argsort(scores)[::-1][:k]
+                    # Get TOP 10 items from ALS
+                    top_indices = np.argsort(scores)[::-1][:10]
                     for idx in top_indices:
                         if np.isinf(scores[idx]): continue
                         pid = self.loader.get_product_id(int(idx))
@@ -342,16 +455,21 @@ class SessionRecommender:
                             als_recommendations.append({
                                 'productId': int(pid),
                                 'score': float(scores[idx]),
-                                'cluster': self.loader.get_item_cluster(int(idx))
+                                'cluster': self.loader.get_item_cluster(int(idx)),
+                                'source': 'als_hybrid'
                             })
 
             # === Step 3: Content Branch ===
+            # Get 10 items from K-means clusters (based on session)
             content_recommendations = []
             if enable_cluster_boost:
-                content_recommendations = self.retrieve_cluster_candidates(session_events, limit_per_cluster=k//2)
+                # Get ~10 items total from clusters (prioritize last_item_cluster)
+                content_recommendations = self.retrieve_cluster_candidates(session_events, limit_per_cluster=5)
+                # Limit to 10 items max from content
+                content_recommendations = content_recommendations[:10]
                 
-            # === Step 4: Fusion ===
-            final_recommendations = self.interleave_results(als_recommendations, content_recommendations, k)
+            # === Step 4: Merge - Combine ALS (10) + Content (10) = 20 total ===
+            final_recommendations = self.merge_results(als_recommendations, content_recommendations)
             
             return {
                 "recommendations": final_recommendations,
