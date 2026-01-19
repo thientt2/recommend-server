@@ -140,57 +140,94 @@ class RecommendationEngine:
             return []
     
     async def get_similar_items(self, product_id: int, k: int = 10) -> List[Dict[str, Any]]:
-        """Get similar items based on product features/cluster"""
+        """Get similar items based on product clustering and ALS embeddings"""
         cache_key = f"rec:similar:{product_id}:k:{k}"
         cached = cache.get(cache_key)
         if cached:
             return cached
         
         try:
-            product_features = self.model_loader.product_features
-            if product_features is None:
+            # 1. Map external ID to internal ID
+            internal_id = self.model_loader.get_item_internal_id(product_id)
+            if internal_id is None:
+                logger.warning(f"Product {product_id} not found in model mappings")
                 return []
+
+            # 2. Get Cluster ID
+            cluster_id = self.model_loader.get_item_cluster(internal_id)
+            if cluster_id is None:
+                # Fallback: if no cluster, just find similar by embedding global
+                logger.info(f"Product {product_id} has no cluster, falling back to global similarity")
+                # (Optional: implement global nearest neighbors if needed, but for now just return empty or proceed)
             
-            # Find product's cluster
-            if 'product_id' in product_features.columns:
-                product_row = product_features[product_features['product_id'] == product_id]
+            # 3. Get candidates
+            # If we have a cluster, get items in that cluster. If not, maybe skip or use all items?
+            # Let's stick to cluster-based retrieval for efficiency if possible.
+            candidates_internal_ids = []
+            if cluster_id is not None:
+                candidates_internal_ids = self.model_loader.get_items_by_cluster(cluster_id)
             else:
-                product_row = product_features[product_features.index == product_id]
+                 # If no cluster, maybe we shouldn't return anything or it's too expensive to scan all
+                 return []
             
-            if len(product_row) == 0:
+            # Filter out the query item
+            candidates_internal_ids = [mid for mid in candidates_internal_ids if mid != internal_id]
+            
+            if not candidates_internal_ids:
                 return []
-            
-            cluster = product_row.iloc[0].get('cluster', None)
-            if cluster is None:
-                return []
-            
-            # Get other products in the same cluster
-            if 'product_id' in product_features.columns:
-                same_cluster = product_features[
-                    (product_features['cluster'] == cluster) & 
-                    (product_features['product_id'] != product_id)
-                ]
-                similar_ids = same_cluster['product_id'].head(k).tolist()
+
+            # 4. Rank by Cosine Similarity using ALS item factors
+            item_factors = self.model_loader.item_factors
+            if item_factors is not None and internal_id < len(item_factors):
+                query_vector = item_factors[internal_id]
+                norm_query = np.linalg.norm(query_vector)
+                
+                scores = []
+                for candidate_id in candidates_internal_ids:
+                    if candidate_id < len(item_factors):
+                        candidate_vector = item_factors[candidate_id]
+                        norm_candidate = np.linalg.norm(candidate_vector)
+                        
+                        if norm_query > 0 and norm_candidate > 0:
+                            # Cosine similarity
+                            score = np.dot(query_vector, candidate_vector) / (norm_query * norm_candidate)
+                        else:
+                            score = 0.0
+                            
+                        scores.append((candidate_id, score))
+                
+                # Sort by score desc
+                scores.sort(key=lambda x: x[1], reverse=True)
+                top_k = scores[:k]
+                
+                result = []
+                for i, (mid, score) in enumerate(top_k):
+                    pid = self.model_loader.get_product_id(mid)
+                    if pid:
+                        result.append({
+                            'productId': int(pid),
+                            'similarityScore': float(score),
+                            'rank': i + 1
+                        })
             else:
-                same_cluster = product_features[
-                    (product_features['cluster'] == cluster) & 
-                    (product_features.index != product_id)
-                ]
-                similar_ids = same_cluster.index[:k].tolist()
-            
-            result = []
-            for i, pid in enumerate(similar_ids):
-                result.append({
-                    'productId': int(pid),
-                    'similarityScore': 1.0 - (i * 0.05),
-                    'rank': i + 1
-                })
+                # Fallback if no embeddings: just return first K items from cluster
+                logger.warning(f"No item factors available for ranking similar items for {product_id}")
+                top_k_ids = candidates_internal_ids[:k]
+                result = []
+                for i, mid in enumerate(top_k_ids):
+                    pid = self.model_loader.get_product_id(mid)
+                    if pid:
+                        result.append({
+                            'productId': int(pid),
+                            'similarityScore': 1.0, 
+                            'rank': i + 1
+                        })
             
             cache.set(cache_key, result)
             return result
             
         except Exception as e:
-            logger.error(f"Similar items error: {e}")
+            logger.error(f"Similar items error: {e}", exc_info=True)
             return []
 
 recommender = RecommendationEngine()
